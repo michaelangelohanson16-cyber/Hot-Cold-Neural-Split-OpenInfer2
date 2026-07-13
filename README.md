@@ -23,7 +23,7 @@ What's adapted here is the underlying idea — persistent-storage neuron
 tiering driven by a learned predictor — reimplemented for **PC hardware**:
 GPU + NVMe, per-neuron (not cluster) granularity, pure PyTorch.
 
-**PowerInfer-2's own source code is not publicly available** — only the
+**PowerInfer-2's own source code is not publicly available**, only the
 paper. The original **PowerInfer** (Song et al., SJTU IPADS,
 [MIT-licensed, open source](https://github.com/SJTU-IPADS/PowerInfer),
 8,000+ stars) is the actual public ancestor this idea traces back to —
