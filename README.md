@@ -111,12 +111,6 @@ python engine.py generate --split-dir split/ --predictor predictors/ \
 A 4096-hidden model (Mistral-7B/Llama-3.1-8B geometry) is required — the
 cold-record binary layout is compile-time sized for it.
 
-## Origin
-
-This code was extracted from a larger private project (a retrieval-
-grounded QA system) where it served as the model-serving layer. It's
-reproduced here on its own because it's a complete, self-contained idea —
-nothing else from that project is included.
 
 ## License
 
