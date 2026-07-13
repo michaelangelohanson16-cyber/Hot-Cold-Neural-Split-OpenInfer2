@@ -67,27 +67,6 @@ Geometry (hidden dim, layer count, heads, activation function, etc.) is
 read from the base model's own HF config at split time, not hardcoded —
 `--base` accepts any 4096-hidden Llama/Mistral-family model.
 
-## What's real here, and what isn't yet
-
-**Correctness rigor that's actually been exercised:** the dReLU double-
-activation handling is done identically and correctly in both
-`profiler.py` and `predictor.py`'s data collector — the same non-obvious
-fix applied consistently in two places, not just once. A latent bug in
-the gated-FFN activation (`gate · silu(gate) · up` instead of
-`silu(gate) · up`) was caught before the engine ever ran in production.
-
-**What hasn't been validated:** this has never been run end-to-end — no
-profile has been generated, no split produced, no predictor trained, no
-tok/s measured, anywhere. Everything above is a description of a
-coherently-designed pipeline, not a benchmarked result.
-
-**The likely actual bottleneck, if you run this:** `ColdWeightStore.
-read_neurons()` fetches and dequantizes cold neurons one at a time in a
-Python loop. PowerInfer's real throughput advantage comes substantially
-from hand-written C++/CUDA sparse kernels, not just the hot/cold
-algorithm — this is pure PyTorch, and that per-neuron Python loop is
-where I'd expect a real implementation to actually lose to PowerInfer's
-numbers, independent of whether the splitting logic itself is correct.
 
 ## Running it
 
