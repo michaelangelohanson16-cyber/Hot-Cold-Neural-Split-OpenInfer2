@@ -13,8 +13,9 @@ Architecture:
         → sigmoid                              [activation probability]
 
 Why low-rank: at rank=64 the predictor is ~425K params per (layer, expert)
-pair — fast enough to run in <0.1ms on GPU, small enough to keep all
-predictors resident in VRAM.
+pair — measured at ~0.4 ms per batch-1 forward on an RTX 5070 Laptop GPU
+and ~0.3 ms on CPU (kernel-launch overhead dominates at this size; see
+BENCHMARKS.md), and small enough to keep all predictors resident in VRAM.
 
 Training data: collected during profiling via ProfilingDataCollector, which
 records (hidden_state, activation_mask) pairs for each (layer, expert).

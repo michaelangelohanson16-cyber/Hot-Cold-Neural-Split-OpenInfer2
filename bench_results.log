@@ -1,0 +1,24 @@
+C:\Users\micha\Documents\Hot-Cold-Neural-Split-OpenInfer2\splitter.py:380: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\torch\csrc\utils\tensor_new.cpp:1582.)
+  gate_scales = torch.frombuffer(
+environment:
+  python 3.11.9, torch 2.12.0.dev20260408+cu128
+  cpu: Intel64 Family 6 Model 197 Stepping 2, GenuineIntel
+  gpu: NVIDIA GeForce RTX 5070 Laptop GPU
+
+building synthetic cold file: 16 layers x 256 cold neurons (26.2 MB)...
+  built in 10.9s
+
+ColdWeightStore.read_neurons (warm cache, batch 64 neurons/call, 200 calls):
+  median call latency: 65.96 ms
+  throughput:          917 neurons/s
+  effective bandwidth: 5.9 MB/s of cold records
+  raw-mmap baseline:   377,407 records/s (2,415.4 MB/s)
+  => Python-level decode overhead: 411.6x over raw bytes
+
+dequantize_int4 (len 4096): 3,508 vectors/s (285 us/vector)
+  (three vectors per neuron record -> 1,169 neurons/s dequant ceiling)
+
+prefetch predictor forward (4096 -> rank 64 -> 14336, batch 1):
+  cuda: median 0.417 ms  [docstring claims <0.1 ms on GPU]
+  cpu: median 0.302 ms
+

@@ -91,6 +91,30 @@ A 4096-hidden model (Mistral-7B/Llama-3.1-8B geometry) is required — the
 cold-record binary layout is compile-time sized for it.
 
 
+## Tests and measured benchmarks
+
+The component tier is tested and benchmarked without any model download —
+14 tests covering INT4 round-trip bounds, byte-level cold-store format
+fidelity, exactness of the hot+cold FFN decomposition under both
+activation conventions, and predictor learnability, plus measured
+throughput of the cold read path and the prefetch predictor:
+
+```bash
+python -m pytest tests/ -v
+python bench/bench_cold_read.py
+```
+
+Full results, with interpretation, in [BENCHMARKS.md](BENCHMARKS.md), and
+the unedited benchmark output in `bench_results.log`. The headline
+findings are reported there whether they flatter the project or not: the
+decomposition math is verified exact, the on-disk format reads back
+byte-faithfully, and the current per-neuron cold read path measures 412×
+slower than raw access to the same bytes — CPU-bound on dequantization,
+which is the concrete work item standing between this design and a
+meaningful end-to-end benchmark. No end-to-end model run has been
+performed yet.
+
+
 ## License
 
 MIT — see `LICENSE`.
