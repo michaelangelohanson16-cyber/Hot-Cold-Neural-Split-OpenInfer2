@@ -111,8 +111,15 @@ decomposition math is verified exact, the on-disk format reads back
 byte-faithfully, and the current per-neuron cold read path measures 412×
 slower than raw access to the same bytes — CPU-bound on dequantization,
 which is the concrete work item standing between this design and a
-meaningful end-to-end benchmark. No end-to-end model run has been
-performed yet.
+meaningful end-to-end benchmark.
+
+The full pipeline (profile → split → predict → generate) **has now been
+run end to end** on a tiny synthetic 4096-hidden model that fits in RAM;
+it emits correctly-shaped tokens and, in doing so, surfaced and fixed
+three integration bugs the component tests could not reach. Output is
+gibberish (the smoke model is randomly initialized) and no *real* model
+has been run yet — that needs a ≥24 GB machine. Details in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 
 ## License
