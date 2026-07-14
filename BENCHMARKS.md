@@ -101,13 +101,58 @@ now a measurement instead of an assertion.
 
 ---
 
-## What this tier does not cover
+## End-to-end smoke run (synthetic model)
 
-No profile, split, predictor, or generation run has been executed
-against a real model — those require the ~15 GB TurboSparse-Mistral
-download and hours of profiling, and every claim about end-to-end
-tokens-per-second remains unmade. What this tier establishes: the
-arithmetic the engine depends on is correct (decomposition exactness,
-quantization bounds, format fidelity, predictor learnability), and the
-performance work needed before an end-to-end run is worth benchmarking
-is now quantified rather than suspected.
+The full pipeline — profile → split → predictor collect/train → generate —
+has now been run start to finish on a **tiny synthetic model**: a
+randomly-initialized 2-layer Llama with the required 4096 hidden size and
+14336 FFN width, a 50257-token vocabulary, and tied embeddings (642M
+params, small enough to fit the 15 GB RAM that a real 7-8B model does
+not). The point is not output quality — random weights produce gibberish
+by construction — but whether the engine's assembly of hot FP8 weights,
+the INT4 cold store, predictor-guided prefetch, and cross-layer overlap
+actually executes and emits correctly-shaped tokens. It does:
+
+```
+Engine ready.
+Generated 12 tokens in 73.37s (0.2 tok/s)
+betaulative distributor Battery Mith Armour...   (gibberish, as expected)
+```
+
+The 0.2 tok/s is meaningless as a performance figure (CPU, float16
+matmuls, the un-vectorized cold-read path, a 2-layer model); it is
+reported only to show the loop ran.
+
+The value of the run was the bugs it exposed. Every component above is
+unit-tested and correct in isolation, but three defects lived in the
+*seams between them* — exactly where the unit tests, by construction,
+could not reach — and only surfaced when the engine assembled the real
+pieces:
+
+1. **Predictor dtype boundary.** The engine runs activations at the
+   model's compute dtype (float16); predictors are stored float32.
+   `PredictorRegistry.predict` now casts the hidden state to the
+   predictor's dtype.
+2. **RoPE upcast.** The rope cos/sin cache is float32, which silently
+   promoted `q`/`k` to float32 while `v` (which skips rope) stayed
+   float16, breaking `scaled_dot_product_attention`. `_apply_rope` now
+   casts cos/sin to the activation dtype.
+3. **FFN down-projection shape.** The engine's `sparse_ffn` transposed
+   the already-`(H, n)` down-weight, breaking the matmul. Removed. (The
+   FFN-exactness unit test did not catch this because it exercises a
+   reference implementation, not the engine's own `sparse_ffn` — a
+   pointed reminder of why an end-to-end run matters even when every
+   component is green.)
+
+## What this tier still does not cover
+
+The engine now runs end to end, but only on a synthetic model. No profile,
+split, or generation has been run against a **real** trained model —
+that needs a machine that can hold a 7-8B checkpoint (≥24 GB, i.e. a
+cloud GPU box, not the 15 GB laptop this was developed on). Coherent-text
+quality and any real tokens-per-second figure remain unmeasured, and the
+cold-read path still needs vectorizing before a real run is worth
+benchmarking. What is now established: the arithmetic is correct, the
+full pipeline executes and produces correctly-shaped output, and the
+three integration bugs that stood between "components pass" and "engine
+runs" are fixed.

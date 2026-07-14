@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# smoke-test scratch (synthetic model, corpus, split artifacts)
+smoke_model/
+smoke_corpus/
+smoke_out/

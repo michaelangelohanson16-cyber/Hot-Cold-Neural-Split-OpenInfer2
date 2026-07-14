@@ -148,8 +148,11 @@ def _apply_rope(
     B, H, T, D = x.shape
     half = D // 2
     x1, x2 = x[..., :half], x[..., half:]
-    cos_t = cos[:T].unsqueeze(0).unsqueeze(0)
-    sin_t = sin[:T].unsqueeze(0).unsqueeze(0)
+    # The rope cache is built in float32 for precision; cast to the activation
+    # dtype here so q/k don't silently upcast (which would leave v, that skips
+    # rope, at a mismatched dtype going into scaled_dot_product_attention).
+    cos_t = cos[:T].unsqueeze(0).unsqueeze(0).to(x.dtype)
+    sin_t = sin[:T].unsqueeze(0).unsqueeze(0).to(x.dtype)
     rotated = torch.cat([x1 * cos_t - x2 * sin_t,
                          x1 * sin_t + x2 * cos_t], dim=-1)
     return rotated
@@ -185,17 +188,20 @@ def sparse_ffn(
     """
     results = []
 
+    # down_hot / down_cold are stored (H, n_neurons); F.linear(h, W) computes
+    # h @ W.T, so passing them directly maps the (B, n_neurons) activation to
+    # (B, H). (An earlier .t() here double-transposed and broke the matmul.)
     if gate_hot is not None and gate_hot.shape[0] > 0:
         g = F.linear(x, gate_hot)
         u = F.linear(x, up_hot)
-        results.append(F.linear(_gated_act(g, u, activation, act_on_both), down_hot.t()))
+        results.append(F.linear(_gated_act(g, u, activation, act_on_both), down_hot))
 
     if gate_cold is not None and gate_cold.shape[0] > 0:
         xf = x.float()
         g = F.linear(xf, gate_cold)
         u = F.linear(xf, up_cold)
         results.append(
-            F.linear(_gated_act(g, u, activation, act_on_both), down_cold.t()).to(x.dtype)
+            F.linear(_gated_act(g, u, activation, act_on_both), down_cold).to(x.dtype)
         )
 
     if not results:

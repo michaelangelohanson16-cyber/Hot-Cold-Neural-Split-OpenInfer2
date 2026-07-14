@@ -448,6 +448,11 @@ class PredictorRegistry:
         if predictor is None:
             return None
         with torch.no_grad():
+            # The engine runs its hidden states at the model's compute dtype
+            # (e.g. float16), but predictors are trained and stored in float32.
+            # Cast at this boundary so the matmul dtypes agree regardless of
+            # what precision the caller is running.
+            hidden_state = hidden_state.to(next(predictor.parameters()).dtype)
             return predictor.predict_mask(hidden_state, threshold)
 
     def vram_usage_mb(self) -> float:
