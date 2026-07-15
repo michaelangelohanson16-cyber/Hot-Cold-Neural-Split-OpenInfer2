@@ -39,6 +39,9 @@ if [ ! -d repo ]; then
     git clone --depth 1 https://github.com/michaelangelohanson16-cyber/Hot-Cold-Neural-Split-OpenInfer2.git repo
 fi
 cd repo
+# Many GPU-cloud base images ship a PEP-668 "externally managed" system
+# Python; --break-system-packages is the pragmatic choice on a throwaway pod.
+export PIP_BREAK_SYSTEM_PACKAGES=1
 pip install -q --upgrade "transformers>=4.44" numpy safetensors accelerate sentencepiece
 
 banner "2. Build a small profiling corpus (public-domain Gutenberg plain text)"
