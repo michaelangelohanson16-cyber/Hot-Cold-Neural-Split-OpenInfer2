@@ -568,7 +568,9 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == "generate":
-        tok = AutoTokenizer.from_pretrained(args.tokenizer)
+        # trust_remote_code so tokenizers from checkpoints with custom code
+        # (e.g. the dReLU/bamboo TurboSparse family) load non-interactively.
+        tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
         ids = tok(args.prompt, return_tensors="pt").input_ids.to(args.device)
 
         model = DesdemonaEngine(args.split_dir, args.predictor, args.device)
