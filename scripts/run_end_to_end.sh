@@ -37,8 +37,11 @@ banner "1. Fetch code + deps"
 mkdir -p "$WORK" && cd "$WORK"
 if [ ! -d repo ]; then
     git clone --depth 1 https://github.com/michaelangelohanson16-cyber/Hot-Cold-Neural-Split-OpenInfer2.git repo
+else
+    git -C repo pull --ff-only || true    # pick up fixes on a rerun
 fi
 cd repo
+mkdir -p out
 # Many GPU-cloud base images ship a PEP-668 "externally managed" system
 # Python; --break-system-packages is the pragmatic choice on a throwaway pod.
 export PIP_BREAK_SYSTEM_PACKAGES=1

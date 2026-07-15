@@ -255,6 +255,11 @@ class NeuronProfiler:
 
     def save_profile(self, path: str, model_config=None):
         cfg = model_config or {}
+        # Create the output directory if the caller pointed at a nested path
+        # (e.g. out/profile.json) that doesn't exist yet.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         freqs = self.get_activation_frequencies()
 
         # Compute summary stats
