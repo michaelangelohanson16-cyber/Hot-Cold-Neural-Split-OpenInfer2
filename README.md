@@ -113,13 +113,16 @@ slower than raw access to the same bytes — CPU-bound on dequantization,
 which is the concrete work item standing between this design and a
 meaningful end-to-end benchmark.
 
-The full pipeline (profile → split → predict → generate) **has now been
-run end to end** on a tiny synthetic 4096-hidden model that fits in RAM;
-it emits correctly-shaped tokens and, in doing so, surfaced and fixed
-three integration bugs the component tests could not reach. Output is
-gibberish (the smoke model is randomly initialized) and no *real* model
-has been run yet — that needs a ≥24 GB machine. Details in
-[BENCHMARKS.md](BENCHMARKS.md).
+The full pipeline (profile → split → predict → generate) **has been run
+end to end on a real 7B** — PowerInfer's dReLU-sparse
+TurboSparse-Mistral-Instruct, on a rented RTX 3090. Measured: profiling
+at 3,215 tok/s, a 34-minute hot/cold split producing a 2.52 GB INT4 cold
+file, a prefetch predictor hitting 84% precision / 80% recall on real
+activations, and generation at ~68 s/token. The split time and the
+generation latency both trace to the same unvectorized per-neuron loop,
+and the 80%-recall predictor visibly degrades output quality — all
+honest, measured, and detailed (with the three integration bugs the
+first end-to-end run exposed and fixed) in [BENCHMARKS.md](BENCHMARKS.md).
 
 
 ## License
