@@ -295,6 +295,9 @@ def split_dense(
         "num_attention_heads":   hf_cfg.num_attention_heads,
         "num_key_value_heads":   hf_cfg.num_key_value_heads,
         "rope_theta":            getattr(hf_cfg, "rope_theta", 10000.0),
+        # Llama-3.1 'llama3' frequency scaling; the engine applies it (it was
+        # previously ignored, so rotations differed from the checkpoint's).
+        "rope_scaling":          getattr(hf_cfg, "rope_scaling", None),
         "rms_norm_eps":          hf_cfg.rms_norm_eps,
         "hidden_act":            hf_cfg.hidden_act,
         # dReLU family (TurboSparse/Bamboo) applies the activation to BOTH

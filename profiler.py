@@ -43,7 +43,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from magnitude import MassAccumulator, save_thresholds, load_thresholds  # noqa: F401
 
 # ─── Architecture detection ───────────────────────────────────────────────────
 
@@ -69,20 +69,43 @@ def detect_arch(model) -> str:
 
 class NeuronProfiler:
     """
-    Registers hooks on FFN gate/activation outputs and accumulates
-    per-neuron activation counts across the profiling corpus.
+    Registers hooks on every FFN and accumulates per-neuron activation
+    statistics across the profiling corpus.
+
+    "Fired" is a MAGNITUDE criterion (magnitude.py), not the old sign test.
+    The old hook counted silu(gate) > 0 as fired; on Hermes-3-Llama-3.1-8B
+    that keeps 23.9% of neurons while the 99%-mass set needs 82.6%, so it
+    dropped real work (desdemona-x3 docs/OPENINFER_STEP0_RESULTS.md s.2).
+    Now, per (layer, expert):
+      - |a| mass per neuron, with a = down_proj's input = act(g)*u
+        (act(g)*act(u) for dReLU), and the per-token share of neurons that
+        carries 90/95/99% of mass (k90/k95/k99);
+      - a reservoir of |act(g)| from which per-layer CATS thresholds tau_L
+        are calibrated (arXiv 2404.08763) for any target sparsity;
+      - per-neuron active frequency under |act(g)| >= tau_L, which is what
+        splitter.py ranks hot neurons by;
+      - the legacy >0 share, reported only, so old numbers stay comparable.
     """
 
-    def __init__(self, model: nn.Module, arch: str):
+    def __init__(self, model: nn.Module, arch: str, thresholds: Optional[dict] = None):
         self.model = model
         self.arch = arch
         self.hooks: list = []
-
-        # {layer_idx: {expert_idx: Tensor(intermediate_dim)}}
-        self.activation_counts: dict[int, dict[int, torch.Tensor]] = {}
-        self.token_counts: dict[int, dict[int, int]] = {}
-
+        # {layer_idx: {expert_idx: MassAccumulator}}
+        self.acc: dict[int, dict[int, MassAccumulator]] = {}
+        self._pending_act: dict[tuple[int, int], torch.Tensor] = {}
+        # thresholds: {layer_idx: {"0.40": tau, ...}} from a previous calibration
+        self.thresholds = thresholds or {}
         self._register_hooks()
+
+    # Kept for callers of the old attribute names.
+    @property
+    def activation_counts(self):
+        return {li: {ei: a.mass for ei, a in ex.items()} for li, ex in self.acc.items()}
+
+    @property
+    def token_counts(self):
+        return {li: {ei: a.tokens for ei, a in ex.items()} for li, ex in self.acc.items()}
 
     # ── hook registration ──────────────────────────────────────────────────
 
@@ -90,98 +113,48 @@ class NeuronProfiler:
         layers = self.model.model.layers
         for layer_idx, layer in enumerate(layers):
             if self.arch == "mixtral":
-                self._register_moe_hooks(layer_idx, layer)
+                for ei, expert in enumerate(layer.block_sparse_moe.experts):
+                    self._register_ffn_hooks(layer_idx, ei, expert)
             else:
-                self._register_dense_hooks(layer_idx, layer)
+                self._register_ffn_hooks(layer_idx, 0, layer.mlp)
 
-    def _make_hook(self, layer_idx: int, expert_idx: int):
-        """Returns a forward hook that accumulates activation counts."""
-        def hook(module, input, output: torch.Tensor):
-            # output: (batch, seq_len, intermediate_dim) after activation fn
-            # Count neurons where output > 0 (fired)
-            fired = (output.detach() > 0).float()          # (B, T, D)
-            counts = fired.sum(dim=(0, 1)).cpu()            # (D,)
-            tokens = output.shape[0] * output.shape[1]
+    def _accumulator(self, layer_idx: int, expert_idx: int, I: int) -> MassAccumulator:
+        ex = self.acc.setdefault(layer_idx, {})
+        if expert_idx not in ex:
+            ex[expert_idx] = MassAccumulator(I, seed=layer_idx * 1000 + expert_idx)
+            if layer_idx in self.thresholds:
+                ex[expert_idx].set_thresholds(self.thresholds[layer_idx])
+        return ex[expert_idx]
 
-            if layer_idx not in self.activation_counts:
-                self.activation_counts[layer_idx] = {}
-                self.token_counts[layer_idx] = {}
-
-            if expert_idx not in self.activation_counts[layer_idx]:
-                self.activation_counts[layer_idx][expert_idx] = \
-                    torch.zeros(output.shape[-1])
-                self.token_counts[layer_idx][expert_idx] = 0
-
-            self.activation_counts[layer_idx][expert_idx] += counts
-            self.token_counts[layer_idx][expert_idx] += tokens
-
+    def _make_act_hook(self, layer_idx: int, expert_idx: int):
+        """Stores act(gate) until the matching down_proj input arrives."""
+        def hook(module, inputs, output: torch.Tensor):
+            self._pending_act[(layer_idx, expert_idx)] = output.detach()
         return hook
 
-    def _make_down_pre_hook(self, layer_idx: int, expert_idx: int):
-        """
-        Counts nonzero entries of down_proj's INPUT — the actual per-neuron
-        contribution pattern. Needed for dReLU/Bamboo models, whose shared
-        act_fn module fires twice per forward (once per branch) and whose
-        built-in predictor mask zeroes neurons after activation; hooking
-        act_fn there would double-count and miss the mask.
-        """
+    def _make_down_pre_hook(self, layer_idx: int, expert_idx: int, gate_from_act: bool):
+        """down_proj's INPUT is the true per-neuron contribution a. For dReLU/
+        Bamboo the shared act_fn fires twice per forward (once per branch) and
+        a built-in mask zeroes neurons afterwards, so a itself is used as the
+        gate signal there (|a| > 0 iff the neuron contributes)."""
         def hook(module, inputs):
-            h_in = inputs[0]                                  # (B, T, D)
-            fired  = (h_in.detach() != 0).float()
-            counts = fired.sum(dim=(0, 1)).cpu()
-            tokens = h_in.shape[0] * h_in.shape[1]
-
-            self.activation_counts.setdefault(layer_idx, {})
-            self.token_counts.setdefault(layer_idx, {})
-            if expert_idx not in self.activation_counts[layer_idx]:
-                self.activation_counts[layer_idx][expert_idx] = \
-                    torch.zeros(h_in.shape[-1])
-                self.token_counts[layer_idx][expert_idx] = 0
-
-            self.activation_counts[layer_idx][expert_idx] += counts
-            self.token_counts[layer_idx][expert_idx] += tokens
+            a = inputs[0].detach()
+            act_g = self._pending_act.pop((layer_idx, expert_idx), None) if gate_from_act else None
+            if act_g is None or act_g.shape != a.shape:
+                act_g = a
+            self._accumulator(layer_idx, expert_idx, a.shape[-1]).feed(act_g, a)
         return hook
 
-    def _register_dense_hooks(self, layer_idx: int, layer):
-        mlp = layer.mlp
-
-        if self.arch == "bamboo":
-            h = mlp.down_proj.register_forward_pre_hook(
-                self._make_down_pre_hook(layer_idx, 0)
-            )
-            self.hooks.append(h)
-            return
-
-        # LLaMA / Mistral uses SwiGLU: act_fn applied to gate_proj output
-        # The intermediate activation lives in mlp.act_fn or we hook the
-        # post-activation by wrapping forward.  Safest: hook act_fn directly.
-        target = None
-        if hasattr(mlp, "act_fn"):
-            target = mlp.act_fn
-        elif hasattr(mlp, "activation_fn"):
-            target = mlp.activation_fn
-        else:
-            # Fallback: hook the whole MLP forward, capture gate * up product
-            target = mlp
-
-        h = target.register_forward_hook(self._make_hook(layer_idx, 0))
-        self.hooks.append(h)
-
-    def _register_moe_hooks(self, layer_idx: int, layer):
-        for expert_idx, expert in enumerate(layer.block_sparse_moe.experts):
-            mlp = expert
-            target = None
-            if hasattr(mlp, "act_fn"):
-                target = mlp.act_fn
-            elif hasattr(mlp, "activation_fn"):
-                target = mlp.activation_fn
-            else:
-                target = mlp
-
-            h = target.register_forward_hook(
-                self._make_hook(layer_idx, expert_idx)
-            )
-            self.hooks.append(h)
+    def _register_ffn_hooks(self, layer_idx: int, expert_idx: int, mlp):
+        target = getattr(mlp, "act_fn", None) or getattr(mlp, "activation_fn", None)
+        gate_from_act = self.arch != "bamboo" and target is not None
+        if gate_from_act:
+            self.hooks.append(target.register_forward_hook(self._make_act_hook(layer_idx, expert_idx)))
+        down = getattr(mlp, "down_proj", None) or getattr(mlp, "w2", None)
+        if down is None:
+            raise ValueError(f"layer {layer_idx}: FFN has no down_proj/w2 to read activations from")
+        self.hooks.append(down.register_forward_pre_hook(
+            self._make_down_pre_hook(layer_idx, expert_idx, gate_from_act)))
 
     # ── profiling loop ─────────────────────────────────────────────────────
 
@@ -239,50 +212,42 @@ class NeuronProfiler:
 
     # ── output ─────────────────────────────────────────────────────────────
 
-    def get_activation_frequencies(self) -> dict:
-        """
-        Returns per-neuron activation frequency (fraction of tokens where
-        neuron fired) for every (layer, expert) pair.
-        """
-        freqs: dict[int, dict[int, list[float]]] = {}
-        for layer_idx, experts in self.activation_counts.items():
-            freqs[layer_idx] = {}
-            for expert_idx, counts in experts.items():
-                n_tokens = self.token_counts[layer_idx][expert_idx]
-                freq = (counts / n_tokens).tolist() if n_tokens > 0 else []
-                freqs[layer_idx][expert_idx] = freq
-        return freqs
+    def calibrate_thresholds(self, sparsities=(0.2, 0.3, 0.4, 0.5, 0.6)) -> dict:
+        """Per-layer CATS tau for each target sparsity: {layer: {"0.40": tau}}."""
+        return {li: ex[0].calibrate(sparsities) for li, ex in self.acc.items() if 0 in ex}
 
-    def save_profile(self, path: str, model_config=None):
+    def get_activation_frequencies(self, threshold_key: Optional[str] = None) -> dict:
+        """Per-neuron active frequency under the magnitude criterion
+        |act(g)| >= tau_L[threshold_key]; without thresholds, normalised |a|
+        mass (a magnitude ranking, never the old sign count)."""
+        return {li: {ei: a.frequencies(threshold_key) for ei, a in ex.items()}
+                for li, ex in self.acc.items()}
+
+    def save_profile(self, path: str, model_config=None, threshold_key: Optional[str] = None):
         cfg = model_config or {}
-        # Create the output directory if the caller pointed at a nested path
-        # (e.g. out/profile.json) that doesn't exist yet.
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        freqs = self.get_activation_frequencies()
+        freqs = self.get_activation_frequencies(threshold_key)
 
-        # Compute summary stats
-        all_freqs = []
-        for layer_experts in freqs.values():
-            for freq_list in layer_experts.values():
-                all_freqs.extend(freq_list)
-
-        t = torch.tensor(all_freqs)
+        all_freqs = [f for ex in freqs.values() for fl in ex.values() for f in fl]
+        t = torch.tensor(all_freqs) if all_freqs else torch.zeros(1)
+        per_layer = {str(li): {f"expert_{ei}": a.summary() for ei, a in ex.items()}
+                     for li, ex in self.acc.items()}
         summary = {
+            "criterion":              f"|act(g)| >= tau_L[{threshold_key}]" if threshold_key
+                                      else "normalised |act(g)*u| mass",
             "mean_activation_rate":   float(t.mean()),
             "median_activation_rate": float(t.median()),
-            "p10":  float(t.quantile(0.10)),
-            "p25":  float(t.quantile(0.25)),
-            "p75":  float(t.quantile(0.75)),
-            "p90":  float(t.quantile(0.90)),
+            "p10":  float(t.quantile(0.10)) if t.numel() <= 16_000_000 else None,
+            "p90":  float(t.quantile(0.90)) if t.numel() <= 16_000_000 else None,
         }
+        for k in ("pos_frac_legacy", "k90", "k95", "k99"):
+            vals = [v[k] for ex in per_layer.values() for v in ex.values() if k in v]
+            if vals:
+                summary[k] = sum(vals) / len(vals)
 
-        total_tokens = max(
-            sum(v for layer in self.token_counts.values() for v in layer.values()),
-            1
-        )
-
+        total_tokens = max(sum(a.tokens for ex in self.acc.values() for a in ex.values()), 1)
         profile = {
             "arch":             self.arch,
             "hidden_dim":       cfg.get("hidden_size", None),
@@ -291,15 +256,12 @@ class NeuronProfiler:
             "num_experts":      cfg.get("num_local_experts", None),
             "total_tokens":     total_tokens,
             "summary":          summary,
+            "layer_stats":      per_layer,
             "layers":           {
-                str(li): {
-                    f"expert_{ei}": freq_list
-                    for ei, freq_list in experts.items()
-                }
-                for li, experts in freqs.items()
+                str(li): {f"expert_{ei}": fl for ei, fl in ex.items()}
+                for li, ex in freqs.items()
             },
         }
-
         with open(path, "w") as f:
             json.dump(profile, f, separators=(",", ":"))
         print(f"Profile saved → {path}  ({os.path.getsize(path)/1e6:.1f} MB)")
@@ -380,6 +342,11 @@ def main():
                         choices=["float16", "bfloat16", "float32"],
                         help="Model load dtype (default: float16)")
     parser.add_argument("--device",    default="cuda")
+    parser.add_argument("--thresholds", default=None,
+                        help="thresholds.json from an earlier run; enables per-neuron "
+                             "active frequency under |act(g)| >= tau_L")
+    parser.add_argument("--sparsity",  type=float, default=0.40,
+                        help="Target sparsity whose tau_L ranks neurons (default 0.40)")
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="Needed for checkpoints with custom modeling code "
                              "(e.g. TurboSparse/Bamboo)")
@@ -391,6 +358,7 @@ def main():
         "float32":  torch.float32,
     }
 
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     print(f"Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=True, trust_remote_code=args.trust_remote_code
@@ -406,7 +374,13 @@ def main():
     arch = detect_arch(model)
     print(f"Architecture detected: {arch}")
 
-    profiler = NeuronProfiler(model, arch)
+    sparsities = (0.2, 0.3, 0.4, 0.5, 0.6)
+    key = f"{args.sparsity:.2f}"
+    thr = None
+    if args.thresholds:
+        with open(args.thresholds) as f:
+            thr = {int(k): v for k, v in json.load(f)["layers"].items()}
+    profiler = NeuronProfiler(model, arch, thresholds=thr)
 
     try:
         profiler.profile_corpus(
@@ -420,7 +394,13 @@ def main():
         profiler.remove_hooks()
 
     cfg = model.config.to_dict() if hasattr(model, "config") else {}
-    profiler.save_profile(args.output, cfg)
+    taus = profiler.calibrate_thresholds(sparsities)
+    thr_out = os.path.join(os.path.dirname(args.output) or ".", "thresholds.json")
+    if not args.thresholds:
+        save_thresholds(thr_out, taus, {"corpus": args.corpus, "criterion": "|act(g)| quantile (CATS)"})
+        print(f"Thresholds saved → {thr_out}. Re-run with --thresholds {thr_out} to rank "
+              f"neurons by active frequency at sparsity {key}; this profile ranks by |a| mass.")
+    profiler.save_profile(args.output, cfg, threshold_key=key if thr else None)
 
     classify_neurons(args.output, hot_count=args.hot_count)
 

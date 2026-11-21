@@ -42,12 +42,15 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from magnitude import active_mask, load_thresholds
 
 
 # ─── Model ────────────────────────────────────────────────────────────────────
@@ -108,8 +111,15 @@ class ProfilingDataCollector:
     per (layer, expert) pair.  Large datasets need not fit in RAM.
     """
 
-    def __init__(self, model: nn.Module, arch: str, output_dir: str):
+    def __init__(self, model: nn.Module, arch: str, output_dir: str,
+                 thresholds: Optional[dict] = None):
         self.model = model
+        # Per-layer CATS tau_L (magnitude.py). Labels are |act(g)| >= tau_L,
+        # not the old act(g) > 0 sign test, which on SwiGLU drops neurons that
+        # carry real mass. No thresholds -> tau 0 -> every neuron labelled
+        # active: correct but useless as a prefetch filter, so calibrate first
+        # (profiler.py writes thresholds.json).
+        self.thresholds = thresholds or {}
         self.arch = arch
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -140,7 +150,8 @@ class ProfilingDataCollector:
         """Captures post-activation output (which neurons fired)."""
         def hook(module, input, output):
             # output: (batch, seq_len, intermediate_dim)
-            mask = (output.detach().cpu() > 0).reshape(
+            tau = float(self.thresholds.get(layer_idx, 0.0))
+            mask = active_mask(output.detach().float().cpu(), tau).reshape(
                 -1, output.shape[-1]
             )                                              # (B*T, D) bool
             key = (layer_idx, expert_idx)
@@ -475,6 +486,10 @@ def main():
     c.add_argument("--output",  default="predictor_data/")
     c.add_argument("--tokens",  type=int, default=1_000_000)
     c.add_argument("--device",  default="cuda")
+    c.add_argument("--thresholds", default=None,
+                   help="thresholds.json from profiler.py (labels = |act(g)| >= tau_L)")
+    c.add_argument("--sparsity", type=float, default=0.40,
+                   help="Which calibrated sparsity's tau_L to label with")
     c.add_argument("--trust-remote-code", action="store_true",
                    help="Needed for checkpoints with custom modeling code "
                         "(e.g. TurboSparse/Bamboo)")
@@ -502,7 +517,8 @@ def main():
         model.eval()
         from profiler import detect_arch
         arch      = detect_arch(model)
-        collector = ProfilingDataCollector(model, arch, args.output)
+        thr = load_thresholds(args.thresholds, args.sparsity) if args.thresholds else None
+        collector = ProfilingDataCollector(model, arch, args.output, thresholds=thr)
         collector.collect(tokenizer, args.corpus, args.tokens, device=args.device)
 
     elif args.cmd == "train":
